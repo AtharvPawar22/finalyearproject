@@ -46,6 +46,7 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
   const [hasNfcSupport, setHasNfcSupport] = useState<boolean>(true);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [remainingBalance, setRemainingBalance] = useState<number>(0);
+  const [isSimulated, setIsSimulated] = useState<boolean>(false);
 
   // ── Channel (two-phone / two-tab demo) mode ────────────────────────────
   const [payMode, setPayMode] = useState<PayMode>("channel");
@@ -79,6 +80,7 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
       setStep("SCAN_TAP_1");
       setActiveRequest(null);
       setErrorMsg(null);
+      setIsSimulated(false);
       const nfcAvailable = isWebNFCSupported();
       setHasNfcSupport(nfcAvailable);
       setChannelError(null);
@@ -174,6 +176,33 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
       n: activeRequest.n,
       ts: Date.now(),
     };
+
+    // ── SIMULATION / OFFLINE DEMO MODE ─────────────────────────────────
+    if (isSimulated) {
+      setStep("VERIFYING_TERMINAL");
+      await new Promise((res) => setTimeout(res, 800));
+
+      const deductRes = await deductWalletBalance(
+        activeRequest.amt,
+        activeRequest.tid,
+        activeRequest.mid,
+        activeRequest.n
+      );
+
+      if (deductRes.success) {
+        if (typeof navigator !== "undefined" && navigator.vibrate) {
+          navigator.vibrate([80, 40, 80]);
+        }
+        setRemainingBalance(deductRes.newBalancePaise);
+        setStep("SUCCESS");
+        onPaymentComplete(deductRes.newBalancePaise);
+      } else {
+        setErrorMsg(deductRes.error || "Deduction failed");
+        setStep("ERROR");
+      }
+      setIsProcessing(false);
+      return;
+    }
 
     // ── CHANNEL MODE ────────────────────────────────────────────────────
     if (payMode === "channel") {
@@ -314,6 +343,7 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
       amt: 10000,
       n: Math.random().toString(16).substring(2, 10),
     };
+    setIsSimulated(true);
     setActiveRequest(mockRequest);
     setStep("CONFIRM_PAY");
   };

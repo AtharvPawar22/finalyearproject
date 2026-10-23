@@ -2,6 +2,7 @@ const CACHE_NAME = "netzero-pay-v2";
 
 const STATIC_ASSETS = [
   "/",
+  "/terminal",
   "/test-nfc",
   "/manifest.json",
   "/favicon.ico"
