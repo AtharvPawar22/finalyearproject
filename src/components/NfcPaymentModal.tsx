@@ -56,14 +56,19 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
 
   // Stable callback so it can be passed to joinChannel without recreating channel
   const handleChannelMessage = useCallback(
-    (msg: PaymentRequestPayload | { t: string }) => {
+    (msg: PaymentRequestPayload | { t: string; tid?: string }) => {
       if (msg.t === "REQ") {
         const req = msg as PaymentRequestPayload;
-        setActiveRequest(req);
-        setStep("CONFIRM_PAY");
-        if (typeof navigator !== "undefined" && navigator.vibrate) {
-          navigator.vibrate(80);
-        }
+        setActiveRequest((prev) => {
+          if (!prev || prev.tid !== req.tid) {
+            setStep((s) => (s === "SCAN_TAP_1" ? "CONFIRM_PAY" : s));
+            if (typeof navigator !== "undefined" && navigator.vibrate) {
+              navigator.vibrate(80);
+            }
+            return req;
+          }
+          return prev;
+        });
       }
     },
     []

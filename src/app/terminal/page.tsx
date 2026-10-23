@@ -185,6 +185,17 @@ export default function TerminalPage() {
     };
   }, [handleConnectSession]);
 
+  // Pulse payment request every 2.5s while waiting for customer so customer phone catches it immediately
+  useEffect(() => {
+    if (step !== "WAITING_CUSTOMER" || !activeRequest) return;
+
+    const interval = setInterval(() => {
+      publishMessage(activeRequest).catch(() => {});
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [step, activeRequest]);
+
   // ─── Start Payment ───────────────────────────────────────────────────────
 
   const handleStartPayment = async () => {
