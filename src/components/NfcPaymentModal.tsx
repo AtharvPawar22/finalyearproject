@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   X,
   Radio,
@@ -10,10 +10,18 @@ import {
   ArrowRight,
   RefreshCw,
   Zap,
+  Wifi,
 } from "lucide-react";
 import { nfcController, isWebNFCSupported } from "@/lib/nfc";
 import { formatPaise } from "@/lib/protocol";
 import { deductWalletBalance } from "@/lib/wallet";
+import {
+  joinChannel,
+  publishMessage,
+  leaveChannel,
+  setChannelMessageHandler,
+} from "@/lib/realtimeChannel";
+import { isSupabaseConfigured } from "@/lib/supabase";
 import { PaymentRequestPayload, PaymentApprovedPayload, UserWallet } from "@/types";
 
 interface NfcPaymentModalProps {
@@ -24,6 +32,7 @@ interface NfcPaymentModalProps {
 }
 
 type Step = "SCAN_TAP_1" | "CONFIRM_PAY" | "WRITE_TAP_2" | "VERIFYING_TERMINAL" | "SUCCESS" | "ERROR";
+type PayMode = "nfc" | "channel";
 
 export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
   isOpen,
@@ -38,22 +47,59 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [remainingBalance, setRemainingBalance] = useState<number>(0);
 
+  // ── Channel (two-phone / two-tab demo) mode ────────────────────────────
+  const [payMode, setPayMode] = useState<PayMode>("channel");
+  const [sessionInput, setSessionInput] = useState<string>("demo01");
+  const [channelConnecting, setChannelConnecting] = useState(false);
+  const [channelConnected, setChannelConnected] = useState(false);
+  const [channelError, setChannelError] = useState<string | null>(null);
+
+  // Stable callback so it can be passed to joinChannel without recreating channel
+  const handleChannelMessage = useCallback(
+    (msg: PaymentRequestPayload | { t: string }) => {
+      if (msg.t === "REQ") {
+        const req = msg as PaymentRequestPayload;
+        setActiveRequest(req);
+        setStep("CONFIRM_PAY");
+        if (typeof navigator !== "undefined" && navigator.vibrate) {
+          navigator.vibrate(80);
+        }
+      }
+    },
+    []
+  );
+
   useEffect(() => {
     if (isOpen) {
       setStep("SCAN_TAP_1");
       setActiveRequest(null);
       setErrorMsg(null);
-      setHasNfcSupport(isWebNFCSupported());
+      const nfcAvailable = isWebNFCSupported();
+      setHasNfcSupport(nfcAvailable);
+      setChannelError(null);
 
-      if (isWebNFCSupported()) {
+      // Default mode: if Web NFC is not available, default to channel mode!
+      if (!nfcAvailable) {
+        setPayMode("channel");
+      }
+
+      // Auto-connect to default session if in channel mode
+      connectToSession("demo01");
+
+      if (nfcAvailable) {
         startScanLoop();
       }
     } else {
       nfcController.stopScan();
+      leaveChannel().catch(console.error);
+      setChannelConnected(false);
+      setChannelConnecting(false);
     }
     return () => {
       nfcController.stopScan();
+      leaveChannel().catch(console.error);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
   const startScanLoop = async () => {
@@ -78,11 +124,35 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
     }
   };
 
+  // ── Channel connect ──────────────────────────────────────────────────
+
+  const connectToSession = async (sess: string) => {
+    setChannelConnecting(true);
+    setChannelError(null);
+    try {
+      await joinChannel(sess, handleChannelMessage as Parameters<typeof joinChannel>[1]);
+      setChannelConnected(true);
+      setChannelConnecting(false);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setChannelError(msg);
+      setChannelConnecting(false);
+    }
+  };
+
+  const handleConnectChannel = async () => {
+    await connectToSession(sessionInput);
+  };
+
+  // ── Approve payment ──────────────────────────────────────────────────
+
   const handleApprovePayment = async () => {
     if (!activeRequest || !wallet) return;
 
     if (wallet.balancePaise < activeRequest.amt) {
-      setErrorMsg(`Insufficient funds. Required: ${formatPaise(activeRequest.amt)}, Balance: ${formatPaise(wallet.balancePaise)}`);
+      setErrorMsg(
+        `Insufficient funds. Required: ${formatPaise(activeRequest.amt)}, Balance: ${formatPaise(wallet.balancePaise)}`
+      );
       setStep("ERROR");
       return;
     }
@@ -100,32 +170,30 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
       ts: Date.now(),
     };
 
-    if (isWebNFCSupported()) {
+    // ── CHANNEL MODE ────────────────────────────────────────────────────
+    if (payMode === "channel") {
       try {
-        // Step 1: Write PAYMENT_APPROVED to NT3H2111 tag
-        await nfcController.writeApproval(approvalPayload);
-
-        // Step 2: Transition to Verifying state while awaiting ESP32 PAYMENT_RESULT
+        await publishMessage(approvalPayload);
         setStep("VERIFYING_TERMINAL");
 
-        // Step 3: Listen for merchant PAYMENT_RESULT (timeout: 7000ms)
-        const resultPayload = await new Promise<{ s: "OK" | "FAIL"; msg?: string }>((resolve, reject) => {
-          const timeoutId = setTimeout(() => {
-            nfcController.setMessageListener(null);
-            // Fallback: If merchant OLED shows OK and user tapped, allow completion or alert
-            resolve({ s: "OK" });
-          }, 4500);
+        // Wait for RES OK from merchant terminal via channel
+        const resultPayload = await new Promise<{ s: "OK" | "FAIL"; msg?: string }>(
+          (resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+              setChannelMessageHandler(handleChannelMessage);
+              reject(new Error("Timed out waiting for merchant confirmation (10s)"));
+            }, 10000);
 
-          nfcController.setMessageListener((msg) => {
-            if (msg.t === "RES" && msg.tid === activeRequest.tid) {
-              clearTimeout(timeoutId);
-              nfcController.setMessageListener(null);
-              resolve(msg);
-            }
-          });
-        });
+            setChannelMessageHandler((msg) => {
+              if (msg.t === "RES" && (msg as { tid: string }).tid === activeRequest.tid) {
+                clearTimeout(timeoutId);
+                setChannelMessageHandler(handleChannelMessage);
+                resolve(msg as { s: "OK" | "FAIL"; msg?: string });
+              }
+            });
+          }
+        );
 
-        // Step 4: Deduct local balance ONLY after confirmed success
         if (resultPayload.s === "OK") {
           const deductRes = await deductWalletBalance(
             activeRequest.amt,
@@ -133,7 +201,6 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
             activeRequest.mid,
             activeRequest.n
           );
-
           if (deductRes.success) {
             if (typeof navigator !== "undefined" && navigator.vibrate) {
               navigator.vibrate([80, 40, 80]);
@@ -146,7 +213,60 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
             setStep("ERROR");
           }
         } else {
-          // Merchant reported failure: DO NOT DEDUCT
+          setErrorMsg(resultPayload.msg || "Merchant terminal declined the transaction.");
+          setStep("ERROR");
+        }
+      } catch (err: unknown) {
+        setErrorMsg(err instanceof Error ? err.message : "Channel payment failed");
+        setStep("ERROR");
+      } finally {
+        setIsProcessing(false);
+      }
+      return;
+    }
+
+    // ── NFC MODE ────────────────────────────────────────────────────────
+    if (isWebNFCSupported()) {
+      try {
+        await nfcController.writeApproval(approvalPayload);
+        setStep("VERIFYING_TERMINAL");
+
+        const resultPayload = await new Promise<{ s: "OK" | "FAIL"; msg?: string }>(
+          (resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+              nfcController.setMessageListener(null);
+              resolve({ s: "OK" });
+            }, 4500);
+
+            nfcController.setMessageListener((msg) => {
+              if (msg.t === "RES" && msg.tid === activeRequest.tid) {
+                clearTimeout(timeoutId);
+                nfcController.setMessageListener(null);
+                resolve(msg);
+              }
+            });
+          }
+        );
+
+        if (resultPayload.s === "OK") {
+          const deductRes = await deductWalletBalance(
+            activeRequest.amt,
+            activeRequest.tid,
+            activeRequest.mid,
+            activeRequest.n
+          );
+          if (deductRes.success) {
+            if (typeof navigator !== "undefined" && navigator.vibrate) {
+              navigator.vibrate([80, 40, 80]);
+            }
+            setRemainingBalance(deductRes.newBalancePaise);
+            setStep("SUCCESS");
+            onPaymentComplete(deductRes.newBalancePaise);
+          } else {
+            setErrorMsg(deductRes.error || "Failed to commit local balance deduction");
+            setStep("ERROR");
+          }
+        } else {
           setErrorMsg(resultPayload.msg || "Merchant terminal declined the transaction.");
           setStep("ERROR");
         }
@@ -199,6 +319,13 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
     ? `TX-${activeRequest.tid.split("_")[1]?.slice(-6) || activeRequest.tid.slice(-7)}`
     : "";
 
+  const merchantDisplayName =
+    activeRequest?.mid === "DEMO_STORE_01"
+      ? "Campus Canteen"
+      : activeRequest?.mid === "NETZERO_TERMINAL_01"
+      ? "NetZero Demo Store"
+      : activeRequest?.mid ?? "";
+
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/40 backdrop-blur-sm animate-fade-in">
       <div className="w-full max-w-md bg-white rounded-t-3xl sm:rounded-2xl border border-slate-200 p-6 sm:p-7 shadow-modal relative animate-modal-up">
@@ -214,38 +341,129 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
         {step === "SCAN_TAP_1" && (
           <div className="flex flex-col items-center text-center space-y-5 py-4">
             <div className="w-16 h-16 rounded-full bg-slate-50 border border-slate-200 flex items-center justify-center text-slate-800">
-              <Radio className="w-7 h-7 stroke-[1.75]" />
+              {payMode === "channel" ? (
+                <Wifi className="w-7 h-7 stroke-[1.75] text-slate-800 animate-pulse" />
+              ) : (
+                <Radio className="w-7 h-7 stroke-[1.75]" />
+              )}
             </div>
 
             <div className="space-y-1">
               <h3 className="text-lg font-bold text-slate-900 uppercase tracking-tight">
-                Tap Phone on Terminal
+                {payMode === "channel" ? "Awaiting Payment Request" : "Tap Phone on Terminal"}
               </h3>
               <p className="text-xs text-slate-500 max-w-xs leading-relaxed">
-                Hold the back of your phone near the merchant terminal to receive payment request.
+                {payMode === "channel"
+                  ? "Enter the session code to receive live payment request from Merchant Terminal."
+                  : "Hold the back of your phone near the merchant terminal to receive payment request."}
               </p>
             </div>
 
-            {/* Non-NFC Fallback */}
-            {!hasNfcSupport && (
-              <div className="w-full p-4 rounded-xl bg-slate-50 border border-slate-200 text-left space-y-2">
-                <div className="flex items-center space-x-1.5 text-xs font-semibold text-slate-700">
-                  <Smartphone className="w-3.5 h-3.5" />
-                  <span>Desktop Testing Mode</span>
-                </div>
-                <p className="text-[11px] text-slate-500">
-                  Web NFC operates on Android Chrome. For desktop evaluation, trigger test terminal request:
-                </p>
+            {/* Mode toggle: NFC vs Channel */}
+            <div className="w-full">
+              {/* Tab toggle */}
+              <div className="flex border border-slate-200 rounded-xl p-0.5 mb-4 bg-slate-50">
                 <button
-                  type="button"
-                  onClick={handleSimulateMerchantTap}
-                  className="w-full py-2 px-3 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 transition-colors flex items-center justify-center space-x-1.5 shadow-sm"
+                  onClick={() => setPayMode("channel")}
+                  className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                    payMode === "channel"
+                      ? "bg-white text-slate-900 shadow-sm"
+                      : "text-slate-500 hover:text-slate-700"
+                  }`}
                 >
-                  <Zap className="w-3.5 h-3.5" />
-                  <span>Simulate Terminal Tap (₹100.00)</span>
+                  Two-Phone Demo
+                </button>
+                <button
+                  onClick={() => setPayMode("nfc")}
+                  className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                    payMode === "nfc"
+                      ? "bg-white text-slate-900 shadow-sm"
+                      : "text-slate-500 hover:text-slate-700"
+                  }`}
+                >
+                  NFC Hardware
                 </button>
               </div>
-            )}
+
+              {/* Channel mode UI */}
+              {payMode === "channel" && (
+                <div className="w-full p-4 rounded-xl bg-slate-50 border border-slate-200 text-left space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-1.5 text-xs font-semibold text-slate-800">
+                      <Wifi className="w-3.5 h-3.5 text-slate-700" />
+                      <span>Live Terminal Session</span>
+                    </div>
+                    {channelConnected && (
+                      <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-700">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                        <span>Connected</span>
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    Set amount on the Merchant Terminal (Phone A) with session code{" "}
+                    <span className="font-mono font-medium text-slate-700">{sessionInput}</span>.
+                  </p>
+
+                  <div className="flex gap-2">
+                    <input
+                      value={sessionInput}
+                      onChange={(e) =>
+                        setSessionInput(
+                          e.target.value.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12)
+                        )
+                      }
+                      className="flex-1 bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs font-mono text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-slate-400"
+                      placeholder="demo01"
+                    />
+                    <button
+                      onClick={handleConnectChannel}
+                      disabled={channelConnecting}
+                      className="px-3.5 py-2 bg-slate-900 text-white text-xs font-semibold rounded-lg hover:bg-slate-800 disabled:opacity-50 transition-colors whitespace-nowrap"
+                    >
+                      {channelConnecting ? "Connecting…" : channelConnected ? "Re-sync" : "Join"}
+                    </button>
+                  </div>
+                  {channelError && (
+                    <p className="text-[10px] text-red-600 leading-snug">{channelError}</p>
+                  )}
+
+                  <div className="pt-2 border-t border-slate-200/60 flex items-center justify-between text-[11px] text-slate-500">
+                    <span>Quick test on this device?</span>
+                    <button
+                      type="button"
+                      onClick={handleSimulateMerchantTap}
+                      className="font-semibold text-slate-800 hover:text-black underline"
+                    >
+                      Trigger ₹100 Test Tap
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* NFC mode fallback */}
+              {payMode === "nfc" && (
+                <div className="w-full p-4 rounded-xl bg-slate-50 border border-slate-200 text-left space-y-2">
+                  <div className="flex items-center space-x-1.5 text-xs font-semibold text-slate-700">
+                    <Smartphone className="w-3.5 h-3.5" />
+                    <span>{hasNfcSupport ? "Web NFC Ready" : "Hardware NFC Mode"}</span>
+                  </div>
+                  <p className="text-[11px] text-slate-500">
+                    {hasNfcSupport
+                      ? "Hold the back of this phone near the NT3H2111 antenna connected to the ESP32."
+                      : "Web NFC requires Android Chrome. For simulation or testing without hardware:"}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleSimulateMerchantTap}
+                    className="w-full py-2 px-3 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 transition-colors flex items-center justify-center space-x-1.5 shadow-sm"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    <span>Simulate Terminal Tap (₹100.00)</span>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -256,9 +474,12 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
               <p className="text-xs uppercase font-semibold text-slate-500 tracking-wider">
                 Payment Request
               </p>
-              <h3 className="text-base font-bold text-slate-900">
-                {activeRequest.mid === "DEMO_STORE_01" ? "Campus Canteen" : activeRequest.mid}
-              </h3>
+              <h3 className="text-base font-bold text-slate-900">{merchantDisplayName}</h3>
+              {payMode === "channel" && (
+                <p className="text-[10px] text-emerald-600 font-medium flex items-center justify-center gap-1">
+                  <Wifi className="w-3 h-3" /> Terminal Session · {sessionInput}
+                </p>
+              )}
             </div>
 
             {/* Requested Amount Hero */}
@@ -320,10 +541,12 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
 
             <div className="space-y-1">
               <h3 className="text-lg font-bold text-slate-900 uppercase tracking-tight">
-                Hold Phone to Terminal
+                {payMode === "channel" ? "Authorizing Payment" : "Hold Phone to Terminal"}
               </h3>
               <p className="text-xs text-slate-500 max-w-xs leading-relaxed">
-                Writing signed transaction to merchant hardware...
+                {payMode === "channel"
+                  ? "Transmitting cryptographic approval to merchant terminal…"
+                  : "Writing signed transaction to merchant hardware..."}
               </p>
             </div>
           </div>
@@ -341,7 +564,7 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
                 Verifying Transaction
               </h3>
               <p className="text-xs text-slate-500 max-w-xs leading-relaxed">
-                Awaiting merchant hardware confirmation...
+                Awaiting merchant confirmation signature…
               </p>
             </div>
           </div>
@@ -355,9 +578,7 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
             </div>
 
             <div className="space-y-0.5">
-              <h3 className="text-xl font-bold text-slate-900">
-                Payment Successful
-              </h3>
+              <h3 className="text-xl font-bold text-slate-900">Payment Successful</h3>
               <p className="text-2xl font-bold text-slate-900 tabular-nums">
                 {formatPaise(activeRequest.amt)}
               </p>
@@ -376,10 +597,16 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
               </div>
               <div className="flex justify-between text-slate-500">
                 <span>Merchant</span>
-                <span className="text-slate-900 font-medium">
-                  {activeRequest.mid === "DEMO_STORE_01" ? "Campus Canteen" : activeRequest.mid}
-                </span>
+                <span className="text-slate-900 font-medium">{merchantDisplayName}</span>
               </div>
+              {payMode === "channel" && (
+                <div className="flex justify-between text-slate-500">
+                  <span>Channel</span>
+                  <span className="text-emerald-700 font-medium flex items-center gap-1 font-mono">
+                    <Wifi className="w-3 h-3" /> {sessionInput}
+                  </span>
+                </div>
+              )}
             </div>
 
             <button
@@ -399,11 +626,9 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
             </div>
 
             <div className="space-y-1">
-              <h3 className="text-base font-bold text-slate-900">
-                Payment Incomplete
-              </h3>
+              <h3 className="text-base font-bold text-slate-900">Payment Incomplete</h3>
               <p className="text-xs text-slate-500 px-4 leading-relaxed">
-                {errorMsg || "Unable to complete NFC transaction. Balance was NOT deducted."}
+                {errorMsg || "Unable to complete transaction. Balance was NOT deducted."}
               </p>
             </div>
 

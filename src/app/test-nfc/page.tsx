@@ -137,6 +137,20 @@ export default function DiagnosticsPage() {
 
       {/* Main Container */}
       <main className="flex-1 w-full max-w-md mx-auto px-4 py-4 space-y-4">
+        {/* Two-Phone Simulation Terminal Link */}
+        <div className="bg-slate-900 text-white rounded-2xl p-4 flex items-center justify-between shadow-sm">
+          <div>
+            <p className="text-xs font-bold text-white">Merchant Terminal (Phone A)</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">Simulate terminal POS on a 2nd phone</p>
+          </div>
+          <Link
+            href="/terminal"
+            className="px-3.5 py-1.5 bg-white text-slate-900 text-xs font-semibold rounded-lg hover:bg-slate-100 transition-colors whitespace-nowrap"
+          >
+            Launch POS
+          </Link>
+        </div>
+
         {/* Status Card */}
         <div className="bg-white rounded-2xl border border-slate-200/80 p-5 shadow-card space-y-1.5">
           <div className="flex items-center justify-between">

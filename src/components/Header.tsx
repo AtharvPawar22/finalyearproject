@@ -2,7 +2,7 @@
 
 import React from "react";
 import Link from "next/link";
-import { SlidersHorizontal } from "lucide-react";
+import { SlidersHorizontal, Store } from "lucide-react";
 
 interface HeaderProps {
   isOnline: boolean;
@@ -39,14 +39,24 @@ export const Header: React.FC<HeaderProps> = ({ isOnline }) => {
           </p>
         </div>
 
-        {/* Developer Diagnostics Link */}
-        <Link
-          href="/test-nfc"
-          title="Hardware Diagnostics"
-          className="w-9 h-9 rounded-full bg-white border border-slate-200/80 flex items-center justify-center text-slate-500 hover:text-slate-900 hover:border-slate-300 transition-colors shadow-subtle"
-        >
-          <SlidersHorizontal className="w-4 h-4" />
-        </Link>
+        {/* Navigation Links */}
+        <div className="flex items-center space-x-2">
+          <Link
+            href="/terminal"
+            title="Open Merchant Terminal"
+            className="px-2.5 py-1.5 rounded-full bg-white border border-slate-200/80 flex items-center space-x-1.5 text-xs font-semibold text-slate-700 hover:text-slate-900 hover:border-slate-300 transition-colors shadow-subtle"
+          >
+            <Store className="w-3.5 h-3.5 text-slate-600" />
+            <span className="hidden xs:inline">Terminal</span>
+          </Link>
+          <Link
+            href="/test-nfc"
+            title="Hardware Diagnostics"
+            className="w-9 h-9 rounded-full bg-white border border-slate-200/80 flex items-center justify-center text-slate-500 hover:text-slate-900 hover:border-slate-300 transition-colors shadow-subtle"
+          >
+            <SlidersHorizontal className="w-4 h-4" />
+          </Link>
+        </div>
       </div>
     </header>
   );
