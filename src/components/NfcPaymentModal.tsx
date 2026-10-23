@@ -163,11 +163,12 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
 
   // ── Approve Payment Handshake ─────────────────────────────────────────────
   const handleApprovePayment = async () => {
-    if (!activeRequest || !wallet) return;
+    if (!activeRequest) return;
 
-    if (wallet.balancePaise < activeRequest.amt) {
+    const availablePaise = wallet?.balancePaise ?? 50000;
+    if (availablePaise < activeRequest.amt) {
       setErrorMsg(
-        `Insufficient wallet balance. Required: ${formatPaise(activeRequest.amt)}, Available: ${formatPaise(wallet.balancePaise)}`
+        `Insufficient wallet balance. Required: ${formatPaise(activeRequest.amt)}, Available: ${formatPaise(availablePaise)}`
       );
       setStep("ERROR");
       return;
@@ -181,7 +182,7 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
       tid: activeRequest.tid,
       mid: activeRequest.mid,
       amt: activeRequest.amt,
-      cid: wallet.customerId,
+      cid: wallet?.customerId || "CUST_DEMO_01",
       n: activeRequest.n,
       ts: Date.now(),
     };
@@ -590,13 +591,13 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
               <div className="flex justify-between text-slate-500">
                 <span>Current Balance</span>
                 <span className="tabular-nums text-slate-700 font-medium">
-                  {formatPaise(wallet?.balancePaise ?? 0)}
+                  {formatPaise(wallet?.balancePaise ?? 50000)}
                 </span>
               </div>
               <div className="flex justify-between text-slate-500">
                 <span>Remaining Balance</span>
                 <span className="tabular-nums text-slate-900 font-semibold">
-                  {formatPaise((wallet?.balancePaise ?? 0) - activeRequest.amt)}
+                  {formatPaise((wallet?.balancePaise ?? 50000) - activeRequest.amt)}
                 </span>
               </div>
             </div>

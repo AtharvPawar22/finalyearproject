@@ -12,13 +12,14 @@ import { NfcPaymentModal } from "@/components/NfcPaymentModal";
 import { AddMoneyModal } from "@/components/AddMoneyModal";
 import { SyncModal } from "@/components/SyncModal";
 import { DemoLoginModal } from "@/components/DemoLoginModal";
-import { TransactionRecord } from "@/types";
+import { TransactionRecord, UserWallet } from "@/types";
 
 export default function DashboardPage() {
   const isOnline = useOnlineStatus();
 
   // Authentication state
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(true);
+  const [activeBalancePaise, setActiveBalancePaise] = useState<number | null>(null);
 
   // Modals state
   const [isPayOpen, setIsPayOpen] = useState(false);
@@ -27,19 +28,34 @@ export default function DashboardPage() {
   const [selectedTxn, setSelectedTxn] = useState<TransactionRecord | null>(null);
 
   useEffect(() => {
-    ensureWalletInitialized();
-    // Check local session
-    if (typeof window !== "undefined") {
-      const authSession = sessionStorage.getItem("netzero_auth_session");
+    ensureWalletInitialized().then((w) => {
+      if (w && typeof w.balancePaise === "number") {
+        setActiveBalancePaise(w.balancePaise);
+      }
+    });
+
+    // Check local session safely
+    try {
+      const authSession =
+        sessionStorage.getItem("netzero_auth_session") ||
+        localStorage.getItem("netzero_auth_session");
       if (!authSession) {
         setIsLoggedIn(false);
       }
+    } catch {
+      setIsLoggedIn(true);
     }
   }, []);
 
   const wallet = useLiveQuery(async () => {
     return await db.wallet.toCollection().first();
   });
+
+  useEffect(() => {
+    if (wallet && typeof wallet.balancePaise === "number") {
+      setActiveBalancePaise(wallet.balancePaise);
+    }
+  }, [wallet]);
 
   const transactions =
     useLiveQuery(async () => {
@@ -52,12 +68,31 @@ export default function DashboardPage() {
     }, []) ?? 0;
 
   const handleLoginSuccess = async (name: string) => {
-    if (typeof window !== "undefined") {
+    try {
       sessionStorage.setItem("netzero_auth_session", "true");
+      localStorage.setItem("netzero_auth_session", "true");
+    } catch {
+      // Storage restricted, proceed anyway
     }
     await db.wallet.update("CUST_DEMO_01", { name, updatedAt: Date.now() });
     setIsLoggedIn(true);
   };
+
+  // Resolved wallet with active instantaneous balance
+  const resolvedWallet: UserWallet | null = wallet
+    ? {
+        ...wallet,
+        balancePaise: activeBalancePaise ?? wallet.balancePaise,
+      }
+    : activeBalancePaise !== null
+    ? {
+        customerId: "CUST_DEMO_01",
+        name: "Atharv (Student Demo)",
+        balancePaise: activeBalancePaise,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }
+    : null;
 
   return (
     <div className="min-h-screen bg-[#F8F9FA] text-slate-900 flex flex-col justify-between selection:bg-slate-900 selection:text-white">
@@ -68,7 +103,7 @@ export default function DashboardPage() {
       <main className="flex-1 w-full max-w-md mx-auto px-4 py-3 space-y-4">
         {/* Wallet Balance Hero */}
         <BalanceCard
-          wallet={wallet || null}
+          wallet={resolvedWallet}
           onOpenPay={() => setIsPayOpen(true)}
           onOpenAddMoney={() => setIsAddMoneyOpen(true)}
           onOpenSync={() => setIsSyncOpen(true)}
@@ -98,15 +133,19 @@ export default function DashboardPage() {
       <NfcPaymentModal
         isOpen={isPayOpen}
         onClose={() => setIsPayOpen(false)}
-        wallet={wallet || null}
-        onPaymentComplete={() => {}}
+        wallet={resolvedWallet}
+        onPaymentComplete={(newBal) => {
+          setActiveBalancePaise(newBal);
+        }}
       />
 
       {/* Add Funds Sheet */}
       <AddMoneyModal
         isOpen={isAddMoneyOpen}
         onClose={() => setIsAddMoneyOpen(false)}
-        onSuccess={() => {}}
+        onSuccess={(newBal) => {
+          setActiveBalancePaise(newBal);
+        }}
       />
 
       {/* Sync Sheet */}
