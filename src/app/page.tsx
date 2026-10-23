@@ -12,12 +12,14 @@ import { NfcPaymentModal } from "@/components/NfcPaymentModal";
 import { AddMoneyModal } from "@/components/AddMoneyModal";
 import { SyncModal } from "@/components/SyncModal";
 import { DemoLoginModal } from "@/components/DemoLoginModal";
+import { RoleSelectionModal } from "@/components/RoleSelectionModal";
 import { TransactionRecord, UserWallet } from "@/types";
 
 export default function DashboardPage() {
   const isOnline = useOnlineStatus();
 
-  // Authentication state
+  // Role Selection & Authentication state
+  const [isRoleModalOpen, setIsRoleModalOpen] = useState<boolean>(false);
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(true);
   const [activeBalancePaise, setActiveBalancePaise] = useState<number | null>(null);
 
@@ -28,13 +30,24 @@ export default function DashboardPage() {
   const [selectedTxn, setSelectedTxn] = useState<TransactionRecord | null>(null);
 
   useEffect(() => {
+    // 1. Check if role has been selected before
+    try {
+      const savedRole = localStorage.getItem("netzero_device_role");
+      if (!savedRole) {
+        setIsRoleModalOpen(true);
+      }
+    } catch {
+      // Storage restricted, proceed
+    }
+
+    // 2. Initialize database & balance
     ensureWalletInitialized().then((w) => {
       if (w && typeof w.balancePaise === "number") {
         setActiveBalancePaise(w.balancePaise);
       }
     });
 
-    // Check local session safely
+    // 3. Check local session safely
     try {
       const authSession =
         sessionStorage.getItem("netzero_auth_session") ||
@@ -97,7 +110,10 @@ export default function DashboardPage() {
   return (
     <div className="min-h-screen bg-[#F8F9FA] text-slate-900 flex flex-col justify-between selection:bg-slate-900 selection:text-white">
       {/* Top Header */}
-      <Header isOnline={isOnline} />
+      <Header
+        isOnline={isOnline}
+        onOpenRoleModal={() => setIsRoleModalOpen(true)}
+      />
 
       {/* Main Container */}
       <main className="flex-1 w-full max-w-md mx-auto px-4 py-3 space-y-4">
@@ -123,9 +139,15 @@ export default function DashboardPage() {
         <span>Protected by Local Web Cryptography & Hardware SE</span>
       </footer>
 
+      {/* Role Selection Modal (Ask Customer vs Merchant on Launch) */}
+      <RoleSelectionModal
+        isOpen={isRoleModalOpen}
+        onSelectCustomer={() => setIsRoleModalOpen(false)}
+      />
+
       {/* Demo Login Modal */}
       <DemoLoginModal
-        isOpen={!isLoggedIn}
+        isOpen={!isLoggedIn && !isRoleModalOpen}
         onLoginSuccess={handleLoginSuccess}
       />
 

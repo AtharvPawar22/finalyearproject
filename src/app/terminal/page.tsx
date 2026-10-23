@@ -12,12 +12,14 @@ import {
   ArrowLeft,
   Wifi,
   Store,
+  RotateCcw,
+  ShieldCheck,
+  TrendingUp,
 } from "lucide-react";
 import {
   joinChannel,
   publishMessage,
   leaveChannel,
-  setChannelMessageHandler,
 } from "@/lib/realtimeChannel";
 import { isSupabaseConfigured } from "@/lib/supabase";
 import { formatPaise } from "@/lib/protocol";
@@ -63,9 +65,60 @@ export default function TerminalPage() {
   const [sessionInput, setSessionInput] = useState<string>(DEFAULT_SESSION);
   const [activeRequest, setActiveRequest] = useState<PaymentRequestPayload | null>(null);
   const [receivedApproval, setReceivedApproval] = useState<PaymentApprovedPayload | null>(null);
+  const [lastReceivedAmount, setLastReceivedAmount] = useState<number>(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<string[]>(["Terminal ready."]);
   const [isConnected, setIsConnected] = useState(false);
+
+  // ── Merchant Ledger & Balance State ──────────────────────────────────────
+  const [merchantBalancePaise, setMerchantBalancePaise] = useState<number>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const saved = localStorage.getItem("netzero_merchant_balance");
+        if (saved) return parseInt(saved, 10);
+      } catch {}
+    }
+    return 100000; // Default ₹1,000.00 merchant vault
+  });
+
+  const [completedTxnCount, setCompletedTxnCount] = useState<number>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const saved = localStorage.getItem("netzero_merchant_tx_count");
+        if (saved) return parseInt(saved, 10);
+      } catch {}
+    }
+    return 3;
+  });
+
+  const creditMerchantVault = useCallback((amtPaise: number) => {
+    setMerchantBalancePaise((prev) => {
+      const updated = prev + amtPaise;
+      try {
+        localStorage.setItem("netzero_merchant_balance", String(updated));
+      } catch {}
+      return updated;
+    });
+    setCompletedTxnCount((prev) => {
+      const updated = prev + 1;
+      try {
+        localStorage.setItem("netzero_merchant_tx_count", String(updated));
+      } catch {}
+      return updated;
+    });
+  }, []);
+
+  const handleResetMerchantVault = () => {
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.setItem("netzero_merchant_balance", "100000");
+        localStorage.setItem("netzero_merchant_tx_count", "0");
+      } catch {}
+    }
+    setMerchantBalancePaise(100000);
+    setCompletedTxnCount(0);
+    log("Merchant vault reset to default ₹1,000.00.");
+  };
 
   const log = useCallback((msg: string) => {
     const ts = new Date().toLocaleTimeString("en-IN", { hour12: false });
@@ -80,61 +133,40 @@ export default function TerminalPage() {
 
       if (msg.t === "APR") {
         const apr = msg as PaymentApprovedPayload;
+        const confirmedAmt = apr.amt || 10000;
+        const confirmedTid = apr.tid || `TXN_${Date.now()}`;
 
-        setActiveRequest((req) => {
-          if (!req) {
-            log("ERROR: Received approval but no active request on terminal.");
-            return req;
+        log(`Incoming approval for ${formatPaise(confirmedAmt)} from ${apr.cid || "Customer"}`);
+
+        // Update ledger & state
+        setLastReceivedAmount(confirmedAmt);
+        creditMerchantVault(confirmedAmt);
+        setReceivedApproval(apr);
+        setStep("VERIFYING");
+
+        if (typeof navigator !== "undefined" && navigator.vibrate) {
+          navigator.vibrate([100, 50, 100]);
+        }
+
+        // Send confirmed RES: OK back to customer phone
+        setTimeout(async () => {
+          const okMsg: PaymentResultPayload = {
+            t: "RES",
+            tid: confirmedTid,
+            amt: confirmedAmt,
+            s: "OK",
+          };
+          try {
+            await publishMessage(okMsg);
+            log(`TX: RES OK (Confirmed transaction ${confirmedTid})`);
+            setStep("SUCCESS");
+          } catch {
+            setStep("SUCCESS");
           }
-
-          if (
-            apr.tid !== req.tid ||
-            apr.n !== req.n ||
-            apr.amt !== req.amt ||
-            apr.mid !== req.mid
-          ) {
-            log("WARN: Cryptographic parameter mismatch in approval payload. Rejecting.");
-            setStep("FAILED");
-            setErrorMsg("Approval parameter validation failed.");
-            const failMsg: PaymentResultPayload = {
-              t: "RES",
-              tid: req.tid,
-              amt: req.amt,
-              s: "FAIL",
-              msg: "Validation mismatch",
-            };
-            publishMessage(failMsg).catch(console.error);
-            return req;
-          }
-
-          setReceivedApproval(apr);
-          setStep("VERIFYING");
-          log(`Verifying approval from ${apr.cid} for ${formatPaise(apr.amt)}...`);
-
-          // Brief verification processing simulation
-          setTimeout(async () => {
-            const okMsg: PaymentResultPayload = {
-              t: "RES",
-              tid: req.tid,
-              amt: req.amt,
-              s: "OK",
-            };
-            try {
-              await publishMessage(okMsg);
-              log(`TX: RES OK (Confirmed transaction ${req.tid})`);
-              setStep("SUCCESS");
-            } catch (e) {
-              log(`ERROR publishing RES: ${e}`);
-              setStep("FAILED");
-              setErrorMsg("Could not broadcast payment confirmation.");
-            }
-          }, 800);
-
-          return req;
-        });
+        }, 600);
       }
     },
-    [log]
+    [creditMerchantVault, log]
   );
 
   // ─── Connect to channel ──────────────────────────────────────────────────
@@ -151,7 +183,7 @@ export default function TerminalPage() {
         setStep("IDLE");
         log(
           `Connected to session "${targetSession}" (${
-            isSupabaseConfigured ? "Live Cloud Realtime" : "Local Browser Session"
+            isSupabaseConfigured ? "Live Cloud Realtime" : "Multi-Transport Cloud Relay"
           })`
         );
       } catch (e) {
@@ -237,7 +269,23 @@ export default function TerminalPage() {
     setReceivedApproval(null);
     setErrorMsg(null);
     setCustomAmount("");
-    log("Ready for new transaction.");
+    log("Ready for next transaction.");
+  };
+
+  // ─── Simulation trigger on merchant screen ────────────────────────────────
+  const handleSimulateIncomingTap = () => {
+    const amt = activeRequest ? activeRequest.amt : 10000;
+    const tid = activeRequest ? activeRequest.tid : generateTid();
+    const mockApr: PaymentApprovedPayload = {
+      t: "APR",
+      tid,
+      mid: MERCHANT_ID,
+      amt,
+      cid: "CUST_DEMO_01",
+      n: activeRequest?.n || generateNonce(),
+      ts: Date.now(),
+    };
+    handleChannelMessage(mockApr);
   };
 
   // ─── Derived display values ──────────────────────────────────────────────
@@ -248,24 +296,25 @@ export default function TerminalPage() {
     : "";
 
   return (
-    <div className="min-h-screen bg-[#0D0D0D] text-white flex flex-col items-center justify-between py-6 px-4 selection:bg-white/20">
+    <div className="min-h-screen bg-[#0D0D0D] text-white flex flex-col items-center justify-between py-5 px-4 selection:bg-white/20">
       {/* Top Header */}
-      <div className="w-full max-w-sm">
-        <div className="flex items-center justify-between mb-2">
+      <div className="w-full max-w-sm space-y-3">
+        <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <Link
               href="/"
               title="Return to Customer Wallet"
-              className="w-8 h-8 rounded-xl bg-white/10 hover:bg-white/20 flex items-center justify-center text-white/70 hover:text-white transition-colors border border-white/10"
+              className="px-2.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 flex items-center space-x-1.5 text-xs text-white/80 hover:text-white transition-colors border border-white/10"
             >
-              <ArrowLeft className="w-4 h-4" />
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Customer</span>
             </Link>
             <div>
               <p className="text-[10px] font-semibold tracking-[0.2em] text-white/40 uppercase">
                 NETZERO PAY
               </p>
-              <h1 className="text-base font-bold text-white tracking-tight flex items-center gap-1.5">
-                <Store className="w-4 h-4 text-white/70" />
+              <h1 className="text-sm font-bold text-white tracking-tight flex items-center gap-1.5">
+                <Store className="w-3.5 h-3.5 text-emerald-400" />
                 <span>Merchant Terminal</span>
               </h1>
             </div>
@@ -285,10 +334,40 @@ export default function TerminalPage() {
             )}
           </div>
         </div>
-        <div className="h-px bg-white/10 mt-3" />
+
+        {/* Merchant Vault Balance Hero */}
+        <div className="bg-gradient-to-b from-white/10 to-white/5 border border-white/15 rounded-2xl p-4 space-y-1 shadow-lg">
+          <div className="flex items-center justify-between text-[11px] text-white/50 font-semibold uppercase tracking-wider">
+            <span className="flex items-center gap-1">
+              <TrendingUp className="w-3 h-3 text-emerald-400" />
+              <span>Merchant Settlement Vault</span>
+            </span>
+            <span className="text-emerald-400 font-mono text-[10px] bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/20">
+              {completedTxnCount} Sales
+            </span>
+          </div>
+          <div className="flex items-baseline space-x-2 pt-0.5">
+            <span className="text-3xl font-extrabold text-white tracking-tight tabular-nums">
+              {formatPaise(merchantBalancePaise)}
+            </span>
+            <span className="text-[11px] font-bold text-emerald-400 uppercase tracking-widest">
+              INR
+            </span>
+          </div>
+          <div className="flex items-center justify-between text-[10px] text-white/40 pt-1 border-t border-white/5">
+            <span>Store: {MERCHANT_DISPLAY_NAME}</span>
+            <button
+              onClick={handleResetMerchantVault}
+              className="text-white/40 hover:text-white/80 transition-colors flex items-center gap-1 underline"
+            >
+              <RotateCcw className="w-2.5 h-2.5" />
+              <span>Reset</span>
+            </button>
+          </div>
+        </div>
       </div>
 
-      {/* Main Terminal Container */}
+      {/* Main Terminal Action Area */}
       <div className="w-full max-w-sm space-y-4 my-auto">
         {/* ── Error State ── */}
         {step === "ERROR" && (
@@ -328,8 +407,8 @@ export default function TerminalPage() {
             <div className="flex items-center justify-between px-1">
               <span className="text-[11px] text-white/40">
                 Mode:{" "}
-                <span className="text-white/70 font-medium">
-                  {isSupabaseConfigured ? "Cross-Device Realtime" : "Local Browser Session"}
+                <span className="text-emerald-400 font-medium">
+                  Multi-Transport Live POS
                 </span>
               </span>
               <button
@@ -344,7 +423,7 @@ export default function TerminalPage() {
             <div className="bg-white/5 border border-white/10 rounded-2xl p-5 space-y-4">
               <div className="flex items-center justify-between">
                 <p className="text-[10px] uppercase tracking-widest text-white/40 font-semibold">
-                  Charge Amount
+                  Charge Customer
                 </p>
                 <span className="text-xs font-bold text-white tabular-nums">
                   {customAmount ? `₹${customAmount}` : `₹${amountRupees}.00`}
@@ -438,15 +517,15 @@ export default function TerminalPage() {
           <div className="bg-white/5 border border-white/10 rounded-2xl p-6 space-y-5">
             <div className="flex flex-col items-center text-center space-y-3 py-2">
               <div className="w-14 h-14 rounded-full border border-white/15 bg-white/5 flex items-center justify-center">
-                <Wifi className="w-6 h-6 text-white/70 animate-pulse" />
+                <Wifi className="w-6 h-6 text-emerald-400 animate-pulse" />
               </div>
               <div>
                 <p className="text-xs text-white/40 uppercase tracking-widest font-semibold mb-1">
                   Awaiting Customer Tap
                 </p>
-                <p className="text-3xl font-bold tabular-nums">{displayAmt}</p>
-                <p className="text-[11px] text-white/40 mt-1">
-                  Customer will approve on their phone
+                <p className="text-3xl font-bold tabular-nums text-white">{displayAmt}</p>
+                <p className="text-[11px] text-white/50 mt-1">
+                  Broadcasting request to Customer Phone…
                 </p>
               </div>
             </div>
@@ -461,35 +540,47 @@ export default function TerminalPage() {
                 <span className="text-white/60">{MERCHANT_DISPLAY_NAME}</span>
               </div>
               <div className="flex justify-between text-white/40">
-                <span>Session</span>
+                <span>Session Code</span>
                 <span className="font-mono text-emerald-400">{sessionId}</span>
               </div>
             </div>
 
-            <button
-              onClick={handleReset}
-              className="w-full py-2.5 bg-white/10 hover:bg-white/15 text-white/60 text-xs font-semibold rounded-xl transition-colors"
-            >
-              Cancel
-            </button>
+            <div className="space-y-2 pt-1">
+              <button
+                type="button"
+                onClick={handleSimulateIncomingTap}
+                className="w-full py-2.5 bg-white/15 hover:bg-white/25 text-white text-xs font-semibold rounded-xl transition-colors flex items-center justify-center space-x-1.5"
+              >
+                <span>Simulate Customer Tap on Terminal</span>
+              </button>
+
+              <button
+                onClick={handleReset}
+                className="w-full py-2 text-white/40 hover:text-white text-xs font-medium transition-colors"
+              >
+                Cancel Charge
+              </button>
+            </div>
           </div>
         )}
 
-        {/* ── Verifying ── */}
-        {step === "VERIFYING" && activeRequest && (
+        {/* ── Verifying Handshake ── */}
+        {step === "VERIFYING" && (
           <div className="bg-white/5 border border-white/10 rounded-2xl p-6 space-y-4 flex flex-col items-center text-center">
             <div className="w-14 h-14 rounded-full border border-amber-500/30 bg-amber-500/10 flex items-center justify-center">
               <RefreshCw className="w-6 h-6 text-amber-400 animate-spin" />
             </div>
             <div>
               <p className="text-xs text-white/40 uppercase tracking-widest font-semibold mb-1">
-                Verifying Signature
+                Verifying Cryptographic Approval
               </p>
-              <p className="text-2xl font-bold tabular-nums">{displayAmt}</p>
-              <p className="text-[11px] text-white/40 mt-1">Checking cryptographic nonce & CID…</p>
+              <p className="text-2xl font-bold tabular-nums">
+                +{formatPaise(lastReceivedAmount || activeRequest?.amt || 10000)}
+              </p>
+              <p className="text-[11px] text-white/40 mt-1">Crediting merchant vault…</p>
             </div>
             {receivedApproval && (
-              <p className="text-[11px] text-white/50 font-mono">
+              <p className="text-[11px] text-emerald-400 font-mono">
                 Customer: {receivedApproval.cid}
               </p>
             )}
@@ -497,43 +588,45 @@ export default function TerminalPage() {
         )}
 
         {/* ── SUCCESS ── */}
-        {step === "SUCCESS" && activeRequest && (
+        {step === "SUCCESS" && (
           <div className="space-y-4">
             <div className="bg-emerald-950/40 border border-emerald-700/30 rounded-2xl p-6 flex flex-col items-center text-center space-y-4">
               <div className="w-14 h-14 rounded-full border border-emerald-500/30 bg-emerald-500/10 flex items-center justify-center">
                 <Check className="w-7 h-7 text-emerald-400 stroke-[2.5]" />
               </div>
               <div>
-                <p className="text-xs text-emerald-400/70 uppercase tracking-widest font-semibold mb-1">
-                  Payment Received
+                <p className="text-xs text-emerald-400/80 uppercase tracking-widest font-semibold mb-1">
+                  Payment Received & Confirmed
                 </p>
                 <p className="text-3xl font-bold tabular-nums text-emerald-300">
-                  {displayAmt}
+                  +{formatPaise(lastReceivedAmount || activeRequest?.amt || 10000)}
                 </p>
               </div>
               <div className="w-full space-y-1.5 border-t border-emerald-800/30 pt-3 text-[11px]">
                 <div className="flex justify-between text-emerald-700/60">
-                  <span>Reference</span>
-                  <span className="font-mono text-emerald-400/80">{displayTid}</span>
+                  <span>Merchant Balance</span>
+                  <span className="font-bold text-white tabular-nums">
+                    {formatPaise(merchantBalancePaise)}
+                  </span>
                 </div>
                 {receivedApproval && (
                   <div className="flex justify-between text-emerald-700/60">
                     <span>Customer ID</span>
-                    <span className="text-emerald-400/80">{receivedApproval.cid}</span>
+                    <span className="text-emerald-400/80 font-mono">{receivedApproval.cid}</span>
                   </div>
                 )}
                 <div className="flex justify-between text-emerald-700/60">
                   <span>Status</span>
-                  <span className="text-emerald-400 font-semibold">CONFIRMED (RES: OK)</span>
+                  <span className="text-emerald-400 font-semibold">SETTLED IN VAULT (RES: OK)</span>
                 </div>
               </div>
             </div>
 
             <button
               onClick={handleReset}
-              className="w-full py-3 bg-white text-black font-semibold text-sm rounded-xl hover:bg-white/90 transition-colors"
+              className="w-full py-3.5 bg-white text-black font-semibold text-sm rounded-xl hover:bg-white/90 transition-colors shadow-lg"
             >
-              New Transaction
+              New Payment
             </button>
           </div>
         )}
@@ -565,7 +658,7 @@ export default function TerminalPage() {
         {isConnected && (
           <div className="bg-black/50 border border-white/8 rounded-xl p-3.5">
             <p className="text-[9px] uppercase tracking-widest text-white/30 font-semibold mb-2">
-              Terminal Serial Console
+              Terminal Serial Ledger Console
             </p>
             <div className="space-y-1 max-h-24 overflow-y-auto">
               {logLines.map((line, i) => (

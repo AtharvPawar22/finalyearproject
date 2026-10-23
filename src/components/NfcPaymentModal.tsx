@@ -187,6 +187,9 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
       ts: Date.now(),
     };
 
+    // Always broadcast approval across network channel so merchant terminal receives it
+    publishMessage(approvalPayload).catch(() => {});
+
     // ── CASE 1: OFFLINE DEMO TAP (Airplane mode, no hardware) ───────────────
     if (isSimulated || payMode === "offline_demo") {
       setStep("VERIFYING_TERMINAL");
