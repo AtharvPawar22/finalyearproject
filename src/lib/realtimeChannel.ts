@@ -128,7 +128,8 @@ export async function joinChannel(
   // 2. Cloud Relay via Server-Sent Events (cross-device mobile support)
   if (typeof window !== "undefined" && "EventSource" in window) {
     try {
-      const sseUrl = `https://ntfy.sh/${encodeURIComponent(cloudTopic)}/sse`;
+      // Connect to SSE with since=10m so recent pending requests are caught immediately
+      const sseUrl = `https://ntfy.sh/${encodeURIComponent(cloudTopic)}/sse?since=10m`;
       const es = new EventSource(sseUrl);
 
       es.onmessage = (event) => {
@@ -152,19 +153,41 @@ export async function joinChannel(
     }
   }
 
-  // 3. Cloud Relay Polling Fallback (runs every 3s in case SSE is blocked by mobile firewall)
+  // 3. Instant one-shot query to grab any request posted before SSE connection
   if (typeof window !== "undefined") {
-    let lastPollTime = Math.floor(Date.now() / 1000) - 15;
-
-    pollTimer = setInterval(async () => {
+    (async () => {
       const { signal, cleanup } = createAbortSignal(2500);
       try {
-        const pollUrl = `https://ntfy.sh/${encodeURIComponent(cloudTopic)}/json?since=${lastPollTime}&poll=1`;
+        const pollUrl = `https://ntfy.sh/${encodeURIComponent(cloudTopic)}/json?since=10m&poll=1`;
         const res = await fetch(pollUrl, { signal });
         if (!res.ok) return;
         const text = await res.text();
-        lastPollTime = Math.floor(Date.now() / 1000) - 2;
+        const lines = text.trim().split("\n");
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const data = JSON.parse(line);
+            if (data && data.event === "message" && data.message) {
+              handleIncomingRaw(data.message);
+            }
+          } catch {}
+        }
+      } catch {
+      } finally {
+        cleanup();
+      }
+    })();
+  }
 
+  // 4. Cloud Relay Polling Fallback (runs every 3s in case SSE is blocked by mobile firewall)
+  if (typeof window !== "undefined") {
+    pollTimer = setInterval(async () => {
+      const { signal, cleanup } = createAbortSignal(2500);
+      try {
+        const pollUrl = `https://ntfy.sh/${encodeURIComponent(cloudTopic)}/json?since=30s&poll=1`;
+        const res = await fetch(pollUrl, { signal });
+        if (!res.ok) return;
+        const text = await res.text();
         const lines = text.trim().split("\n");
         for (const line of lines) {
           if (!line.trim()) continue;
@@ -324,4 +347,36 @@ export function isChannelActive(): boolean {
     activeSupabaseChannel !== null ||
     pollTimer !== null
   );
+}
+
+/**
+ * Actively query ntfy.sh for recent messages and dispatch them to messageHandler.
+ */
+export async function pollChannelNow(sessionId: string): Promise<boolean> {
+  const cleanSessionId = sessionId.toLowerCase().trim() || "demo01";
+  const cloudTopic = cloudTopicName(cleanSessionId);
+  const { signal, cleanup } = createAbortSignal(2500);
+  try {
+    const pollUrl = `https://ntfy.sh/${encodeURIComponent(cloudTopic)}/json?since=10m&poll=1`;
+    const res = await fetch(pollUrl, { signal });
+    if (!res.ok) return false;
+    const text = await res.text();
+    const lines = text.trim().split("\n");
+    let found = false;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const data = JSON.parse(line);
+        if (data && data.event === "message" && data.message) {
+          handleIncomingRaw(data.message);
+          found = true;
+        }
+      } catch {}
+    }
+    return found;
+  } catch {
+    return false;
+  } finally {
+    cleanup();
+  }
 }

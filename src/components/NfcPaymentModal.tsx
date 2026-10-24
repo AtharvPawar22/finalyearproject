@@ -21,6 +21,7 @@ import {
   publishMessage,
   leaveChannel,
   setChannelMessageHandler,
+  pollChannelNow,
 } from "@/lib/realtimeChannel";
 import { PaymentRequestPayload, PaymentApprovedPayload, UserWallet } from "@/types";
 
@@ -28,6 +29,7 @@ interface NfcPaymentModalProps {
   isOpen: boolean;
   onClose: () => void;
   wallet: UserWallet | null;
+  initialRequest?: PaymentRequestPayload | null;
   onPaymentComplete: (newBalancePaise: number) => void;
 }
 
@@ -38,6 +40,7 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
   isOpen,
   onClose,
   wallet,
+  initialRequest,
   onPaymentComplete,
 }) => {
   const [step, setStep] = useState<Step>("SCAN_TAP_1");
@@ -49,7 +52,7 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
   const [isSimulated, setIsSimulated] = useState<boolean>(false);
 
   // ── Mode selection: offline_demo (default) | two_phone | hardware_nfc ──
-  const [payMode, setPayMode] = useState<PayMode>("offline_demo");
+  const [payMode, setPayMode] = useState<PayMode>("two_phone");
   const [sessionInput, setSessionInput] = useState<string>("demo01");
   const [channelConnecting, setChannelConnecting] = useState(false);
   const [channelConnected, setChannelConnected] = useState(false);
@@ -60,16 +63,12 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
       if (msg.t === "REQ") {
         const req = msg as PaymentRequestPayload;
         setIsSimulated(false);
-        setActiveRequest((prev) => {
-          if (!prev || prev.tid !== req.tid) {
-            setStep((s) => (s === "SCAN_TAP_1" ? "CONFIRM_PAY" : s));
-            if (typeof navigator !== "undefined" && navigator.vibrate) {
-              navigator.vibrate(80);
-            }
-            return req;
-          }
-          return prev;
-        });
+        setPayMode("two_phone");
+        setActiveRequest(req);
+        setStep("CONFIRM_PAY");
+        if (typeof navigator !== "undefined" && navigator.vibrate) {
+          navigator.vibrate([80, 40, 80]);
+        }
       }
     },
     []
@@ -77,31 +76,37 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      setStep("SCAN_TAP_1");
-      setActiveRequest(null);
+      if (initialRequest) {
+        setActiveRequest(initialRequest);
+        setIsSimulated(false);
+        setPayMode("two_phone");
+        setStep("CONFIRM_PAY");
+      } else {
+        setStep("SCAN_TAP_1");
+        setActiveRequest(null);
+        setIsSimulated(false);
+      }
       setErrorMsg(null);
-      setIsSimulated(false);
       const nfcAvailable = isWebNFCSupported();
       setHasNfcSupport(nfcAvailable);
 
-      // Connect to background channel for two-phone mode
-      connectToSession("demo01");
+      // Connect to background channel and check for pending requests
+      connectToSession(sessionInput);
+      pollChannelNow(sessionInput).catch(() => {});
 
       if (nfcAvailable && payMode === "hardware_nfc") {
         startScanLoop();
       }
     } else {
       nfcController.stopScan();
-      leaveChannel().catch(console.error);
       setChannelConnected(false);
       setChannelConnecting(false);
     }
     return () => {
       nfcController.stopScan();
-      leaveChannel().catch(console.error);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen]);
+  }, [isOpen, initialRequest]);
 
   const startScanLoop = async () => {
     try {
@@ -159,6 +164,8 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
   const handleCheckRequest = async () => {
     setChannelConnecting(true);
     await connectToSession(sessionInput);
+    await pollChannelNow(sessionInput);
+    setChannelConnecting(false);
   };
 
   // ── Approve Payment Handshake ─────────────────────────────────────────────
@@ -187,14 +194,48 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
       ts: Date.now(),
     };
 
-    // Always broadcast approval across network channel so merchant terminal receives it
-    publishMessage(approvalPayload).catch(() => {});
+    // 1. Broadcast approval across network channel so merchant terminal receives it
+    publishMessage(approvalPayload).catch((e) => {
+      console.warn("[Customer] Publish approval notice:", e);
+    });
 
-    // ── CASE 1: OFFLINE DEMO TAP (Airplane mode, no hardware) ───────────────
-    if (isSimulated || payMode === "offline_demo") {
-      setStep("VERIFYING_TERMINAL");
-      await new Promise((res) => setTimeout(res, 700));
+    setStep("VERIFYING_TERMINAL");
 
+    // 2. If hardware NFC mode, write approval to physical NT3H2111 tag
+    if (payMode === "hardware_nfc" && isWebNFCSupported()) {
+      try {
+        await nfcController.writeApproval(approvalPayload);
+      } catch (err) {
+        console.warn("[NFC] Hardware write warning:", err);
+      }
+    }
+
+    // 3. If two-phone link mode, wait up to 2.5s for terminal's RES: OK, or proceed
+    if (payMode === "two_phone") {
+      try {
+        await new Promise<void>((resolve) => {
+          const timeoutId = setTimeout(() => {
+            setChannelMessageHandler(handleChannelMessage);
+            resolve();
+          }, 2500);
+
+          setChannelMessageHandler((msg) => {
+            if (msg.t === "RES" && (msg as { tid: string }).tid === activeRequest.tid) {
+              clearTimeout(timeoutId);
+              setChannelMessageHandler(handleChannelMessage);
+              resolve();
+            }
+          });
+        });
+      } catch {
+        // Fallback: proceed to commit offline
+      }
+    } else {
+      await new Promise((res) => setTimeout(res, 400));
+    }
+
+    // 4. Commit local cryptographic deduction inside IndexedDB
+    try {
       const deductRes = await deductWalletBalance(
         activeRequest.amt,
         activeRequest.tid,
@@ -210,138 +251,13 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
         setStep("SUCCESS");
         onPaymentComplete(deductRes.newBalancePaise);
       } else {
-        setErrorMsg(deductRes.error || "Local balance deduction failed");
+        setErrorMsg(deductRes.error || "Failed to commit local balance deduction");
         setStep("ERROR");
       }
-      setIsProcessing(false);
-      return;
-    }
-
-    // ── CASE 2: TWO-PHONE LIVE LINK ─────────────────────────────────────────
-    if (payMode === "two_phone") {
-      try {
-        publishMessage(approvalPayload).catch((e) => {
-          console.warn("[Customer] Publish approval notice:", e);
-        });
-        setStep("VERIFYING_TERMINAL");
-
-        // Await RES: OK from Merchant Terminal Phone
-        const resultPayload = await new Promise<{ s: "OK" | "FAIL"; msg?: string }>(
-          (resolve, reject) => {
-            const timeoutId = setTimeout(() => {
-              setChannelMessageHandler(handleChannelMessage);
-              // Fallback: If terminal approved or timed out, commit locally
-              resolve({ s: "OK" });
-            }, 6000);
-
-            setChannelMessageHandler((msg) => {
-              if (msg.t === "RES" && (msg as { tid: string }).tid === activeRequest.tid) {
-                clearTimeout(timeoutId);
-                setChannelMessageHandler(handleChannelMessage);
-                resolve(msg as { s: "OK" | "FAIL"; msg?: string });
-              }
-            });
-          }
-        );
-
-        if (resultPayload.s === "OK") {
-          const deductRes = await deductWalletBalance(
-            activeRequest.amt,
-            activeRequest.tid,
-            activeRequest.mid,
-            activeRequest.n
-          );
-          if (deductRes.success) {
-            if (typeof navigator !== "undefined" && navigator.vibrate) {
-              navigator.vibrate([80, 40, 80]);
-            }
-            setRemainingBalance(deductRes.newBalancePaise);
-            setStep("SUCCESS");
-            onPaymentComplete(deductRes.newBalancePaise);
-          } else {
-            setErrorMsg(deductRes.error || "Failed to commit local balance deduction");
-            setStep("ERROR");
-          }
-        } else {
-          setErrorMsg(resultPayload.msg || "Merchant terminal declined the transaction.");
-          setStep("ERROR");
-        }
-      } catch (err: unknown) {
-        setErrorMsg(err instanceof Error ? err.message : "Channel payment failed");
-        setStep("ERROR");
-      } finally {
-        setIsProcessing(false);
-      }
-      return;
-    }
-
-    // ── CASE 3: HARDWARE NFC (ESP32 + PN532 + NT3H2111) ────────────────────
-    if (isWebNFCSupported()) {
-      try {
-        await nfcController.writeApproval(approvalPayload);
-        setStep("VERIFYING_TERMINAL");
-
-        const resultPayload = await new Promise<{ s: "OK" | "FAIL"; msg?: string }>(
-          (resolve, reject) => {
-            const timeoutId = setTimeout(() => {
-              nfcController.setMessageListener(null);
-              resolve({ s: "OK" });
-            }, 4500);
-
-            nfcController.setMessageListener((msg) => {
-              if (msg.t === "RES" && msg.tid === activeRequest.tid) {
-                clearTimeout(timeoutId);
-                nfcController.setMessageListener(null);
-                resolve(msg);
-              }
-            });
-          }
-        );
-
-        if (resultPayload.s === "OK") {
-          const deductRes = await deductWalletBalance(
-            activeRequest.amt,
-            activeRequest.tid,
-            activeRequest.mid,
-            activeRequest.n
-          );
-          if (deductRes.success) {
-            if (typeof navigator !== "undefined" && navigator.vibrate) {
-              navigator.vibrate([80, 40, 80]);
-            }
-            setRemainingBalance(deductRes.newBalancePaise);
-            setStep("SUCCESS");
-            onPaymentComplete(deductRes.newBalancePaise);
-          } else {
-            setErrorMsg(deductRes.error || "Failed to commit local balance deduction");
-            setStep("ERROR");
-          }
-        } else {
-          setErrorMsg(resultPayload.msg || "Merchant terminal declined the transaction.");
-          setStep("ERROR");
-        }
-      } catch (err: unknown) {
-        setErrorMsg(err instanceof Error ? err.message : "Failed to write NFC approval");
-        setStep("ERROR");
-      } finally {
-        setIsProcessing(false);
-      }
-    } else {
-      // Fallback deduction
-      const deductRes = await deductWalletBalance(
-        activeRequest.amt,
-        activeRequest.tid,
-        activeRequest.mid,
-        activeRequest.n
-      );
-      if (deductRes.success) {
-        setRemainingBalance(deductRes.newBalancePaise);
-        setStep("SUCCESS");
-        onPaymentComplete(deductRes.newBalancePaise);
-      } else {
-        setErrorMsg("Deduction failed");
-        setStep("ERROR");
-      }
+    } catch (err: unknown) {
+      setErrorMsg(err instanceof Error ? err.message : "Payment deduction failed");
+      setStep("ERROR");
+    } finally {
       setIsProcessing(false);
     }
   };

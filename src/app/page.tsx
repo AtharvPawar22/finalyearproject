@@ -13,7 +13,9 @@ import { AddMoneyModal } from "@/components/AddMoneyModal";
 import { SyncModal } from "@/components/SyncModal";
 import { DemoLoginModal } from "@/components/DemoLoginModal";
 import { RoleSelectionModal } from "@/components/RoleSelectionModal";
-import { TransactionRecord, UserWallet } from "@/types";
+import { TransactionRecord, UserWallet, PaymentRequestPayload, ProtocolMessage } from "@/types";
+import { formatPaise } from "@/lib/protocol";
+import { joinChannel, pollChannelNow } from "@/lib/realtimeChannel";
 
 export default function DashboardPage() {
   const isOnline = useOnlineStatus();
@@ -28,6 +30,32 @@ export default function DashboardPage() {
   const [isAddMoneyOpen, setIsAddMoneyOpen] = useState(false);
   const [isSyncOpen, setIsSyncOpen] = useState(false);
   const [selectedTxn, setSelectedTxn] = useState<TransactionRecord | null>(null);
+  const [incomingRequest, setIncomingRequest] = useState<PaymentRequestPayload | null>(null);
+
+  // Background listener for cross-device merchant terminal requests
+  useEffect(() => {
+    const handleGlobalMessage = (msg: ProtocolMessage) => {
+      if (msg.t === "REQ") {
+        const req = msg as PaymentRequestPayload;
+        setIncomingRequest(req);
+        setIsPayOpen(true);
+        if (typeof navigator !== "undefined" && navigator.vibrate) {
+          navigator.vibrate([100, 50, 100]);
+        }
+      }
+    };
+
+    joinChannel("demo01", handleGlobalMessage).catch(console.error);
+    pollChannelNow("demo01").catch(() => {});
+
+    const interval = setInterval(() => {
+      pollChannelNow("demo01").catch(() => {});
+    }, 3000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     // 1. Check if role has been selected before
@@ -117,6 +145,26 @@ export default function DashboardPage() {
 
       {/* Main Container */}
       <main className="flex-1 w-full max-w-md mx-auto px-4 py-3 space-y-4">
+        {/* Incoming Merchant Request Prompt (if modal is closed) */}
+        {incomingRequest && !isPayOpen && (
+          <div className="bg-slate-900 text-white p-4 rounded-2xl shadow-xl border border-slate-700 flex items-center justify-between animate-fade-in">
+            <div className="space-y-0.5">
+              <span className="text-[10px] text-emerald-400 font-semibold uppercase tracking-wider block">
+                Incoming POS Request
+              </span>
+              <p className="text-sm font-bold">
+                {formatPaise(incomingRequest.amt)} from NetZero Demo Store
+              </p>
+            </div>
+            <button
+              onClick={() => setIsPayOpen(true)}
+              className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl shadow transition-colors"
+            >
+              Pay Now
+            </button>
+          </div>
+        )}
+
         {/* Wallet Balance Hero */}
         <BalanceCard
           wallet={resolvedWallet}
@@ -154,10 +202,15 @@ export default function DashboardPage() {
       {/* Payment Sheet */}
       <NfcPaymentModal
         isOpen={isPayOpen}
-        onClose={() => setIsPayOpen(false)}
+        onClose={() => {
+          setIsPayOpen(false);
+          setIncomingRequest(null);
+        }}
+        initialRequest={incomingRequest}
         wallet={resolvedWallet}
         onPaymentComplete={(newBal) => {
           setActiveBalancePaise(newBal);
+          setIncomingRequest(null);
         }}
       />
 
