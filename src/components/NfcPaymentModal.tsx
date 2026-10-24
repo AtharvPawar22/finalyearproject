@@ -220,7 +220,9 @@ export const NfcPaymentModal: React.FC<NfcPaymentModalProps> = ({
     // ── CASE 2: TWO-PHONE LIVE LINK ─────────────────────────────────────────
     if (payMode === "two_phone") {
       try {
-        await publishMessage(approvalPayload);
+        publishMessage(approvalPayload).catch((e) => {
+          console.warn("[Customer] Publish approval notice:", e);
+        });
         setStep("VERIFYING_TERMINAL");
 
         // Await RES: OK from Merchant Terminal Phone

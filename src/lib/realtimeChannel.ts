@@ -14,6 +14,15 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 
 export type ChannelMessageHandler = (msg: ProtocolMessage) => void;
 
+function createAbortSignal(ms: number): { signal: AbortSignal; cleanup: () => void } {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return { signal: AbortSignal.timeout(ms), cleanup: () => {} };
+  }
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cleanup: () => clearTimeout(id) };
+}
+
 let activeSupabaseChannel: RealtimeChannel | null = null;
 let activeLocalChannel: BroadcastChannel | null = null;
 let activeEventSource: EventSource | null = null;
@@ -143,14 +152,15 @@ export async function joinChannel(
     }
   }
 
-  // 3. Cloud Relay Polling Fallback (runs every 2s in case SSE is blocked by mobile firewall)
+  // 3. Cloud Relay Polling Fallback (runs every 3s in case SSE is blocked by mobile firewall)
   if (typeof window !== "undefined") {
     let lastPollTime = Math.floor(Date.now() / 1000) - 15;
 
     pollTimer = setInterval(async () => {
+      const { signal, cleanup } = createAbortSignal(2500);
       try {
         const pollUrl = `https://ntfy.sh/${encodeURIComponent(cloudTopic)}/json?since=${lastPollTime}&poll=1`;
-        const res = await fetch(pollUrl);
+        const res = await fetch(pollUrl, { signal });
         if (!res.ok) return;
         const text = await res.text();
         lastPollTime = Math.floor(Date.now() / 1000) - 2;
@@ -168,9 +178,11 @@ export async function joinChannel(
           }
         }
       } catch {
-        // Network offline or polling error, ignore
+        // Network offline, timeout or polling error, ignore
+      } finally {
+        cleanup();
       }
-    }, 2000);
+    }, 3000);
   }
 
   // 4. Supabase Realtime (if configured via env vars)
@@ -232,6 +244,7 @@ export async function publishMessage(msg: ProtocolMessage): Promise<void> {
   // 2. Broadcast across phones via Cloud Relay (using text/plain so raw JSON is preserved)
   if (currentSessionId) {
     const cloudTopic = cloudTopicName(currentSessionId);
+    const { signal, cleanup } = createAbortSignal(2500);
     try {
       await fetch(`https://ntfy.sh/${encodeURIComponent(cloudTopic)}`, {
         method: "POST",
@@ -240,10 +253,13 @@ export async function publishMessage(msg: ProtocolMessage): Promise<void> {
           "Content-Type": "text/plain",
           Title: `NETZERO_${msg.t}`,
         },
+        signal,
       });
       published = true;
     } catch (e) {
       console.warn("[Realtime] Cloud Relay post error:", e);
+    } finally {
+      cleanup();
     }
   }
 

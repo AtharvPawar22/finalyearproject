@@ -230,14 +230,29 @@ export default function TerminalPage() {
 
   // ─── Start Payment ───────────────────────────────────────────────────────
 
-  const handleStartPayment = async () => {
-    const finalAmount = customAmount
-      ? Math.round(parseFloat(customAmount) * 100)
-      : amountRupees * 100;
+  const currentChargingPaise = (() => {
+    if (customAmount && customAmount.trim().length > 0) {
+      const clean = customAmount.trim().replace(/[^0-9.]/g, "");
+      const val = parseFloat(clean);
+      return !isNaN(val) && val > 0 ? Math.round(val * 100) : 0;
+    }
+    return amountRupees > 0 ? amountRupees * 100 : 0;
+  })();
+
+  const computedAmountDisplay =
+    currentChargingPaise > 0 ? formatPaise(currentChargingPaise) : "";
+
+  const handleStartPayment = () => {
+    const finalAmount = currentChargingPaise;
 
     if (!finalAmount || finalAmount <= 0) {
-      log("ERROR: Invalid amount.");
+      setErrorMsg("Please enter or select a valid amount greater than ₹0.");
+      log("ERROR: Invalid amount requested.");
       return;
+    }
+
+    if (typeof navigator !== "undefined" && navigator.vibrate) {
+      navigator.vibrate(40);
     }
 
     const req: PaymentRequestPayload = {
@@ -249,18 +264,17 @@ export default function TerminalPage() {
       n: generateNonce(),
     };
 
-    try {
-      await publishMessage(req);
-      setActiveRequest(req);
-      setReceivedApproval(null);
-      setStep("WAITING_CUSTOMER");
-      log(`TX: REQ ${req.tid} (${formatPaise(finalAmount)})`);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setErrorMsg(msg);
-      setStep("ERROR");
-      log(`ERROR sending payment request: ${msg}`);
-    }
+    // 1. Instant optimistic UI update — never blocked by network latency
+    setActiveRequest(req);
+    setReceivedApproval(null);
+    setErrorMsg(null);
+    setStep("WAITING_CUSTOMER");
+    log(`TX: REQ ${req.tid} (${formatPaise(finalAmount)})`);
+
+    // 2. Dispatch broadcast asynchronously in background
+    publishMessage(req).catch((err) => {
+      console.warn("[Terminal] Background broadcast notice:", err);
+    });
   };
 
   const handleReset = () => {
@@ -426,7 +440,7 @@ export default function TerminalPage() {
                   Charge Customer
                 </p>
                 <span className="text-xs font-bold text-white tabular-nums">
-                  {customAmount ? `₹${customAmount}` : `₹${amountRupees}.00`}
+                  {computedAmountDisplay || (amountRupees > 0 ? `₹${amountRupees}.00` : "₹0.00")}
                 </span>
               </div>
 
@@ -435,9 +449,11 @@ export default function TerminalPage() {
                 {PRESET_AMOUNTS.map((amt) => (
                   <button
                     key={amt}
+                    type="button"
                     onClick={() => {
                       setAmountRupees(amt);
                       setCustomAmount("");
+                      setErrorMsg(null);
                     }}
                     className={`py-3 rounded-xl text-sm font-semibold transition-all ${
                       amountRupees === amt && !customAmount
@@ -457,23 +473,37 @@ export default function TerminalPage() {
                 </span>
                 <input
                   type="number"
+                  inputMode="decimal"
+                  step="0.01"
                   value={customAmount}
                   onChange={(e) => {
                     setCustomAmount(e.target.value);
                     setAmountRupees(0);
+                    setErrorMsg(null);
                   }}
                   placeholder="Custom amount"
                   className="w-full bg-white/10 border border-white/15 rounded-xl pl-8 pr-3 py-2.5 text-sm font-medium text-white placeholder:text-white/25 focus:outline-none focus:border-white/30"
                 />
               </div>
 
+              {/* Validation alert if present */}
+              {errorMsg && (
+                <div className="bg-red-500/10 border border-red-500/30 text-red-300 text-xs px-3 py-2 rounded-xl flex items-center gap-2">
+                  <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
+
               {/* Start button */}
               <button
+                type="button"
                 onClick={handleStartPayment}
-                className="w-full py-3.5 bg-white text-black font-bold text-sm rounded-xl hover:bg-white/90 active:scale-[0.99] transition-all flex items-center justify-center gap-2 shadow-lg shadow-white/10"
+                className="w-full py-3.5 bg-white text-black font-bold text-sm rounded-xl hover:bg-white/90 active:scale-[0.98] transition-all flex items-center justify-center gap-2 shadow-lg shadow-white/10 cursor-pointer"
               >
-                <Radio className="w-4 h-4" />
-                <span>Request Payment</span>
+                <Radio className="w-4 h-4 text-black animate-pulse" />
+                <span>
+                  Request Payment {computedAmountDisplay ? `(${computedAmountDisplay})` : ""}
+                </span>
                 <ArrowRight className="w-4 h-4" />
               </button>
             </div>
